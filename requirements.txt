@@ -1,6 +1,8 @@
 langchain
+langchain-core
 langchain-community
 langchain-groq
+langchain-tavily
 langchain-text-splitters
 langchain-huggingface
 langchain-chroma
@@ -10,6 +12,7 @@ streamlit
 pypdf
 sentence-transformers
 python-dotenv
-tavily-python
+pydantic
 torch
 torchvision
+ 

@@ -6,3 +6,5 @@ __pycache__/
 chroma_db/
 data/*.pdf
 data/*.txt
+.DS_Store
+myvenv/

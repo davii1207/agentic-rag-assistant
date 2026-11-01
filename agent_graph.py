@@ -15,6 +15,10 @@ load_dotenv()
  
 LLM_MODEL = "openai/gpt-oss-20b"
 RETRIEVAL_K = 4
+# How many times the agent may rewrite the query and re-retrieve before
+# giving up on the documents and falling back to web search.
+# (We will tune this value with the evaluation later.)
+MAX_RETRIES = 1
  
  
 # --------------------------------------------------------------------------
@@ -42,23 +46,34 @@ def get_web_search_tool() -> TavilySearch:
 # State
 # --------------------------------------------------------------------------
 class AgentState(TypedDict):
-    question: str
+    question: str             # the user's original question
+    search_query: str         # the query used for retrieval (may be rewritten)
+    retries: int              # how many rewrites have happened so far
     documents: List[str]      # retrieved text chunks (or web snippets)
     citations: List[str]      # one label per document: "file.pdf, p. 4" or a URL
     web_search_needed: bool
     answer: str
     source: str               # "docs" or "web"
+    steps: List[str]          # human-readable trace of what the agent did
  
  
 def initial_state(question: str) -> AgentState:
     return {
         "question": question,
+        "search_query": question,
+        "retries": 0,
         "documents": [],
         "citations": [],
         "web_search_needed": False,
         "answer": "",
         "source": "docs",
+        "steps": [],
     }
+ 
+ 
+def _log(state: AgentState, message: str) -> List[str]:
+    """Return the trace with one more line appended."""
+    return state.get("steps", []) + [message]
  
  
 class GradeDocuments(BaseModel):
@@ -78,23 +93,28 @@ def _citation_label(metadata: dict) -> str:
  
  
 def retrieve(state: AgentState):
-    question = state["question"]
+    query = state["search_query"]
     retriever = get_retriever(get_vectorstore(), k=RETRIEVAL_K)
-    docs = retriever.invoke(question)
-    print(f"[Retrieve] Found {len(docs)} chunks")
+    docs = retriever.invoke(query)
+    print(f"[Retrieve] Found {len(docs)} chunks for: {query}")
     return {
         "documents": [d.page_content for d in docs],
         "citations": [_citation_label(d.metadata) for d in docs],
+        "steps": _log(state, f'Retrieved {len(docs)} chunks for: "{query}"'),
     }
  
  
 def grade_documents(state: AgentState):
+    # Always grade against the user's ORIGINAL question, not the rewritten query.
     question = state["question"]
     documents = state["documents"]
  
     if not documents:
-        print("[Grade] No documents retrieved -> web search")
-        return {"web_search_needed": True}
+        print("[Grade] No documents retrieved")
+        return {
+            "web_search_needed": True,
+            "steps": _log(state, "Grader: nothing retrieved"),
+        }
  
     combined = "\n\n".join(documents)
     try:
@@ -108,15 +128,47 @@ def grade_documents(state: AgentState):
         ])
         needs_web = not verdict.relevant
         print(f"[Grade] relevant={verdict.relevant}")
+        note = "Grader: relevant" if verdict.relevant else "Grader: NOT relevant"
     except Exception as e:
         # If the grader fails, keep the documents we already have rather than crash.
         print(f"[Grade] Grader failed ({e}); using retrieved documents")
         needs_web = False
+        note = "Grader failed; using retrieved documents"
  
-    return {"web_search_needed": needs_web}
+    return {"web_search_needed": needs_web, "steps": _log(state, note)}
+ 
+ 
+def rewrite_query(state: AgentState):
+    """Ask the LLM for a better retrieval query, then loop back to retrieve."""
+    question = state["question"]
+    previous = state["search_query"]
+ 
+    new_query = previous
+    try:
+        response = get_llm().invoke([
+            SystemMessage(content=(
+                "Rewrite the user's question into a better search query for a vector "
+                "database of document chunks. Use specific keywords and synonyms likely "
+                "to appear in the documents. Return ONLY the rewritten query, nothing else."
+            )),
+            HumanMessage(content=f"Original question: {question}\nPrevious query that failed: {previous}"),
+        ])
+        candidate = (response.content or "").strip().strip('"').strip()
+        if candidate:
+            new_query = candidate
+    except Exception as e:
+        print(f"[Rewrite] Failed ({e}); keeping previous query")
+ 
+    print(f"[Rewrite] {previous!r} -> {new_query!r}")
+    return {
+        "search_query": new_query,
+        "retries": state["retries"] + 1,
+        "steps": _log(state, f'Rewrote query -> "{new_query}"'),
+    }
  
  
 def web_search(state: AgentState):
+    # Web search uses the ORIGINAL question (the rewrite is tuned for the documents).
     question = state["question"]
     print("[Web Search] Searching the web...")
  
@@ -133,6 +185,7 @@ def web_search(state: AgentState):
         "documents": [r["content"] for r in results],
         "citations": [r.get("url", "web") for r in results],
         "source": "web",
+        "steps": _log(state, f"Fell back to web search ({len(results)} results)"),
     }
  
  
@@ -147,6 +200,7 @@ def generate(state: AgentState):
             "answer": "I couldn't find relevant information in your documents or on the web.",
             "source": source,
             "citations": [],
+            "steps": _log(state, "No context found; returned a 'could not find' message"),
         }
  
     labels = citations if len(citations) == len(documents) else ["unknown"] * len(documents)
@@ -166,11 +220,21 @@ Context comes from: {"the user's uploaded documents" if source == "docs" else "a
     ])
  
     unique_citations = list(dict.fromkeys(labels))  # de-duplicate, keep order
-    return {"answer": response.content, "source": source, "citations": unique_citations}
+    return {
+        "answer": response.content,
+        "source": source,
+        "citations": unique_citations,
+        "steps": _log(state, f"Generated answer from {'documents' if source == 'docs' else 'web results'}"),
+    }
  
  
 def decide_next_step(state: AgentState):
-    return "web_search" if state.get("web_search_needed") else "generate"
+    """After grading: answer, retry with a rewritten query, or go to the web."""
+    if not state.get("web_search_needed"):
+        return "generate"
+    if state.get("retries", 0) < MAX_RETRIES:
+        return "rewrite_query"
+    return "web_search"
  
  
 # --------------------------------------------------------------------------
@@ -181,6 +245,7 @@ def build_agent():
  
     workflow.add_node("retrieve", retrieve)
     workflow.add_node("grade_documents", grade_documents)
+    workflow.add_node("rewrite_query", rewrite_query)
     workflow.add_node("web_search", web_search)
     workflow.add_node("generate", generate)
  
@@ -189,8 +254,13 @@ def build_agent():
     workflow.add_conditional_edges(
         "grade_documents",
         decide_next_step,
-        {"web_search": "web_search", "generate": "generate"},
+        {
+            "generate": "generate",
+            "rewrite_query": "rewrite_query",
+            "web_search": "web_search",
+        },
     )
+    workflow.add_edge("rewrite_query", "retrieve")   # the loop
     workflow.add_edge("web_search", "generate")
     workflow.add_edge("generate", END)
  
@@ -209,4 +279,7 @@ if __name__ == "__main__":
         print("\nSources:")
         for c in result["citations"]:
             print(f" - {c}")
+    print("\nAgent steps:")
+    for s in result["steps"]:
+        print(f" - {s}")
     print("=" * 50)

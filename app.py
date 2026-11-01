@@ -33,13 +33,17 @@ if "vectorstore_ready" not in st.session_state:
     st.session_state.vectorstore_ready = knowledge_base_exists()
  
  
-def render_footer(source: str, citations: list):
+def render_footer(source: str, citations: list, steps: list):
     badge = "📄 From your documents" if source == "docs" else "🌐 From web search"
     st.caption(badge)
     if citations:
         with st.expander("Sources"):
             for c in citations:
                 st.write(f"- {c}")
+    if steps:
+        with st.expander("Agent steps"):
+            for i, s in enumerate(steps, 1):
+                st.write(f"{i}. {s}")
  
  
 # ---------------------------------------------------------------- sidebar
@@ -105,7 +109,7 @@ else:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
             if msg["role"] == "assistant" and "source" in msg:
-                render_footer(msg["source"], msg.get("citations", []))
+                render_footer(msg["source"], msg.get("citations", []), msg.get("steps", []))
  
     if question := st.chat_input("Ask a question..."):
         st.session_state.messages.append({"role": "user", "content": question})
@@ -123,10 +127,12 @@ else:
             answer = result["answer"]
             source = result["source"]
             citations = result.get("citations", [])
+            steps = result.get("steps", [])
  
             st.markdown(answer)
-            render_footer(source, citations)
+            render_footer(source, citations, steps)
  
         st.session_state.messages.append(
-            {"role": "assistant", "content": answer, "source": source, "citations": citations}
+            {"role": "assistant", "content": answer, "source": source,
+             "citations": citations, "steps": steps}
         )

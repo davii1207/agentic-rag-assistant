@@ -8,3 +8,6 @@ data/*.pdf
 data/*.txt
 .DS_Store
 myvenv/
+eval/indexes/
+eval/dataset.json
+eval/results/
